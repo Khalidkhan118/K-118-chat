@@ -164,4 +164,56 @@ class ExampleUnitTest {
         )
         assertEquals(2, dupUser.contactIds.size)
     }
+
+    @Test
+    fun testChatId_deterministicBetweenTwoDevices() {
+        val device1Uid = "auth_device_1_xyz"
+        val device2Uid = "auth_device_2_abc"
+
+        fun getChatId(u1: String, u2: String): String =
+            if (u1 < u2) "${u1}_$u2" else "${u2}_$u1"
+
+        val chatIdFromDev1 = getChatId(device1Uid, device2Uid)
+        val chatIdFromDev2 = getChatId(device2Uid, device1Uid)
+
+        assertEquals(chatIdFromDev1, chatIdFromDev2)
+        assertTrue(chatIdFromDev1.startsWith("auth_device_1_xyz") || chatIdFromDev1.startsWith("auth_device_2_abc"))
+    }
+
+    @Test
+    fun testTwoDeviceConversationResolution_withUnderscores() {
+        val myUid = "user_khalid_118"
+        val otherUid = "user_alex_rivera_pro"
+        val chatId = if (myUid < otherUid) "${myUid}_$otherUid" else "${otherUid}_$myUid"
+
+        // Resolution without breaking on inner underscores
+        val resolvedOtherUid = when {
+            chatId.startsWith("${myUid}_") -> chatId.removePrefix("${myUid}_")
+            chatId.endsWith("_${myUid}") -> chatId.removeSuffix("_${myUid}")
+            else -> ""
+        }
+
+        assertEquals(otherUid, resolvedOtherUid)
+    }
+
+    @Test
+    fun testSearchByFirebaseAuthUid() {
+        val users = listOf(
+            com.example.model.User(
+                uid = "9kL8pQ2mZ",
+                displayName = "Device 1 User",
+                email = "device1@test.com"
+            ),
+            com.example.model.User(
+                uid = "4vX7wN1rY",
+                displayName = "Device 2 User",
+                email = "device2@test.com"
+            )
+        )
+
+        val query = "4vx7"
+        val found = users.filter { it.uid.contains(query, ignoreCase = true) }
+        assertEquals(1, found.size)
+        assertEquals("Device 2 User", found.first().displayName)
+    }
 }

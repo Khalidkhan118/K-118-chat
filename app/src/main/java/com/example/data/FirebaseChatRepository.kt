@@ -99,6 +99,27 @@ class FirebaseChatRepository(private val context: Context) {
                 Log.w(tag, "Firebase Storage init note: ${e.message}")
             }
             Log.d(tag, "Firebase initialized successfully")
+
+            // Restore active Firebase Auth user session if already signed in
+            firebaseAuth?.currentUser?.let { fbUser ->
+                val uid = fbUser.uid
+                val email = fbUser.email ?: ""
+                val name = fbUser.displayName ?: if (email.isNotBlank()) email.substringBefore("@") else "User ${uid.take(6)}"
+                val photo = fbUser.photoUrl?.toString() ?: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150"
+                val restored = User(
+                    uid = uid,
+                    displayName = name,
+                    email = email,
+                    photoUrl = photo,
+                    isOnline = true,
+                    lastSeenTimestamp = System.currentTimeMillis(),
+                    bio = "Active on K118"
+                )
+                fallbackUsers[uid] = restored
+                _currentUser.value = restored
+                saveUserToFirestore(restored)
+                loadFriendsAndConversations(uid)
+            }
         } catch (e: Exception) {
             Log.w(tag, "Firebase initialization fallback active: ${e.message}")
         }
@@ -381,6 +402,22 @@ class FirebaseChatRepository(private val context: Context) {
         }
     }
 
+    private suspend fun ensureFirebaseAuthSession(): String? {
+        return try {
+            val auth = firebaseAuth ?: return null
+            if (auth.currentUser != null) {
+                auth.currentUser?.uid
+            } else {
+                val res = auth.signInAnonymously().await()
+                Log.d(tag, "Created Firebase Auth anonymous session with UID: ${res.user?.uid}")
+                res.user?.uid
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Could not ensure Firebase Auth session: ${e.message}")
+            null
+        }
+    }
+
     fun signInAsDemoUser(uid: String): Result<User> {
         val user = fallbackUsers[uid] ?: User(
             uid = uid,
@@ -393,14 +430,19 @@ class FirebaseChatRepository(private val context: Context) {
         fallbackUsers[uid] = onlineUser
         _currentUser.value = onlineUser
 
-        saveUserToFirestore(onlineUser)
-        loadFriendsAndConversations(onlineUser.uid)
+        scope.launch {
+            ensureFirebaseAuthSession()
+            saveUserToFirestore(onlineUser)
+            loadFriendsAndConversations(onlineUser.uid)
+        }
         return Result.success(onlineUser)
     }
 
     fun signInCustom(name: String, email: String, photoUrl: String = ""): Result<User> {
-        val uid = "user_" + email.replace(Regex("[^a-zA-Z0-9]"), "").lowercase().take(12)
-            .ifEmpty { UUID.randomUUID().toString().take(8) }
+        val auth = firebaseAuth
+        val authUid = auth?.currentUser?.uid
+        val uid = authUid ?: ("user_" + email.replace(Regex("[^a-zA-Z0-9]"), "").lowercase().take(12)
+            .ifEmpty { UUID.randomUUID().toString().take(8) })
         val user = User(
             uid = uid,
             displayName = name.ifEmpty { "K118 Chatter" },
@@ -412,8 +454,12 @@ class FirebaseChatRepository(private val context: Context) {
         )
         fallbackUsers[uid] = user
         _currentUser.value = user
-        saveUserToFirestore(user)
-        loadFriendsAndConversations(uid)
+
+        scope.launch {
+            ensureFirebaseAuthSession()
+            saveUserToFirestore(user)
+            loadFriendsAndConversations(uid)
+        }
         return Result.success(user)
     }
 
@@ -669,10 +715,18 @@ class FirebaseChatRepository(private val context: Context) {
         fallbackMessages.forEach { (chatId, msgs) ->
             val visibleMsgs = msgs.filter { !it.deletedForUsers.contains(myUid) }
             if (visibleMsgs.isNotEmpty()) {
-                val parts = chatId.split("_")
-                if (parts.contains(myUid)) {
-                    val otherUid = parts.firstOrNull { it != myUid } ?: ""
-                    val otherUser = fallbackUsers[otherUid] ?: User(uid = otherUid, displayName = "User $otherUid")
+                val otherUid = when {
+                    chatId.startsWith("${myUid}_") -> chatId.removePrefix("${myUid}_")
+                    chatId.endsWith("_${myUid}") -> chatId.removeSuffix("_${myUid}")
+                    else -> {
+                        val sampleMsg = visibleMsgs.firstOrNull { it.senderId == myUid || it.receiverId == myUid }
+                        if (sampleMsg != null) {
+                            if (sampleMsg.senderId == myUid) sampleMsg.receiverId else sampleMsg.senderId
+                        } else ""
+                    }
+                }
+                if (otherUid.isNotBlank()) {
+                    val otherUser = fallbackUsers[otherUid] ?: User(uid = otherUid, displayName = "User ${otherUid.take(6)}")
                     val lastMsg = visibleMsgs.last()
                     val unread = visibleMsgs.count { it.receiverId == myUid && !it.isRead }
                     val displayLastMessage = when {
@@ -918,6 +972,12 @@ class FirebaseChatRepository(private val context: Context) {
             replyToSenderName?.let { msgData["replyToSenderName"] = it }
 
             chatDocRef?.collection("messages")?.document(msgId)?.set(msgData)
+                ?.addOnSuccessListener {
+                    Log.d(tag, "Message $msgId sent to Firestore successfully for chat $chatId")
+                }
+                ?.addOnFailureListener { e ->
+                    Log.e(tag, "Error writing message $msgId to Firestore: ${e.message}", e)
+                }
 
             val summary = when {
                 chatMessage.text.isNotBlank() && chatMessage.mediaUrl.isNotBlank() -> "📷 ${chatMessage.text}"
@@ -929,10 +989,13 @@ class FirebaseChatRepository(private val context: Context) {
                     "participants" to listOf(senderId, receiverId),
                     "lastMessage" to summary,
                     "lastMessageTimestamp" to timestamp,
+                    "lastSenderId" to senderId,
                     "unread_$receiverId" to (fallbackMessages[chatId]?.count { it.receiverId == receiverId && !it.isRead } ?: 1)
                 ),
                 SetOptions.merge()
-            )
+            )?.addOnFailureListener { e ->
+                Log.e(tag, "Error updating chat metadata in Firestore: ${e.message}", e)
+            }
         } catch (e: Exception) {
             Log.w(tag, "Failed to send message to Firestore: ${e.message}")
         }
@@ -1002,7 +1065,16 @@ class FirebaseChatRepository(private val context: Context) {
         }
     }
 
+    private val demoBotUids = setOf(
+        "alex_rivera", "sarah_chen", "elena_rostova",
+        "marcus_vance", "priya_sharma", "lucas_silva", "aisha_noor"
+    )
+
     private fun simulateFriendReplyIfNeeded(myUid: String, friendUid: String, userMessage: String, mediaUrl: String = "") {
+        // IMPORTANT: Never simulate replies between 2 real devices or real Firebase Auth accounts!
+        // Only run simulation when chatting with predefined demo bot personas in offline/demo mode.
+        if (!demoBotUids.contains(friendUid)) return
+        if (myUid != "khalid_118") return
         if (isCommunicationBlocked(myUid, friendUid)) return
         val friend = fallbackUsers[friendUid] ?: return
         if (!friend.isOnline) return
@@ -1057,12 +1129,14 @@ class FirebaseChatRepository(private val context: Context) {
 
     fun markMessagesAsRead(chatId: String, currentUserId: String) {
         val list = fallbackMessages[chatId]
+        val unreadMsgIds = mutableListOf<String>()
         if (list != null) {
             var updated = false
             for (i in list.indices) {
                 if (list[i].receiverId == currentUserId && !list[i].isRead) {
                     val updatedReadBy = (list[i].readBy + currentUserId).distinct()
                     list[i] = list[i].copy(isRead = true, readBy = updatedReadBy)
+                    unreadMsgIds.add(list[i].id)
                     updated = true
                 }
             }
@@ -1074,6 +1148,21 @@ class FirebaseChatRepository(private val context: Context) {
 
         try {
             firestore?.collection("chats")?.document(chatId)?.update("unread_$currentUserId", 0)
+
+            // Update read receipts for all unread messages in Firestore so other device gets blue checkmarks!
+            val messagesCol = firestore?.collection("chats")?.document(chatId)?.collection("messages")
+            if (messagesCol != null && unreadMsgIds.isNotEmpty()) {
+                unreadMsgIds.forEach { msgId ->
+                    messagesCol.document(msgId).update(
+                        mapOf(
+                            "isRead" to true,
+                            "readBy" to FieldValue.arrayUnion(currentUserId)
+                        )
+                    ).addOnFailureListener { e ->
+                        Log.w(tag, "Failed to update read receipt for message $msgId: ${e.message}")
+                    }
+                }
+            }
         } catch (e: Exception) {
             Log.w(tag, "Could not update unread count: ${e.message}")
         }
@@ -1128,8 +1217,9 @@ class FirebaseChatRepository(private val context: Context) {
                     val matchesName = displayName.lowercase().contains(cleanQuery)
                     val matchesEmail = email.lowercase().contains(cleanQuery)
                     val matchesBio = bio.lowercase().contains(cleanQuery)
+                    val matchesUid = uid.lowercase().contains(cleanQuery)
 
-                    if (matchesName || matchesEmail || matchesBio) {
+                    if (matchesName || matchesEmail || matchesBio || matchesUid) {
                         @Suppress("UNCHECKED_CAST")
                         val blocked = (doc.get("blockedUserIds") as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
                         @Suppress("UNCHECKED_CAST")
@@ -1159,6 +1249,7 @@ class FirebaseChatRepository(private val context: Context) {
         // Also merge local / cached matches
         val localMatches = fallbackUsers.values.filter { user ->
             user.uid != currentUserId && (
+                user.uid.lowercase().contains(cleanQuery) ||
                 user.displayName.lowercase().contains(cleanQuery) ||
                 user.email.lowercase().contains(cleanQuery) ||
                 user.bio.lowercase().contains(cleanQuery)
@@ -1168,7 +1259,8 @@ class FirebaseChatRepository(private val context: Context) {
         val combined = (firestoreResults + localMatches).distinctBy { it.uid }
 
         return@withContext combined.sortedWith(
-            compareByDescending<User> { it.email.equals(cleanQuery, ignoreCase = true) }
+            compareByDescending<User> { it.uid.equals(cleanQuery, ignoreCase = true) }
+                .thenByDescending { it.email.equals(cleanQuery, ignoreCase = true) }
                 .thenByDescending { it.displayName.equals(cleanQuery, ignoreCase = true) }
                 .thenByDescending { it.displayName.startsWith(cleanQuery, ignoreCase = true) }
                 .thenByDescending { it.email.startsWith(cleanQuery, ignoreCase = true) }

@@ -1197,6 +1197,21 @@ fun SearchResultUserItem(
                     modifier = Modifier.padding(top = 2.dp)
                 )
             }
+
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.padding(top = 4.dp)
+            ) {
+                Text(
+                    text = "UID: ${user.uid}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.width(8.dp))
