@@ -1,0 +1,6 @@
+{
+  "name": "K118",
+  "description": "Online chat application with Google Sign-In, user profile, friend list, real-time 1-on-1 chat, and online/offline status.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
